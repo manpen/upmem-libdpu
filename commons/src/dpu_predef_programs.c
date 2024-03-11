@@ -66,7 +66,7 @@ fetch_program(const char *name, iram_size_t *size)
 
     FILE *file = fopen(buffer, "rb");
     if (file == NULL) {
-        LOG_FN(WARNING, "ERROR: cannot find file");
+        LOG_FN(WARNING, "ERROR: cannot find file %s", buffer);
         return NULL;
     }
     LOG_FN(VERBOSE, "found file: %s", buffer);
