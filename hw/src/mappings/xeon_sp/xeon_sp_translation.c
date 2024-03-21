@@ -514,6 +514,31 @@ write_512b_to_bank(uint32_t nb_cis, uint8_t *ptr_dest, uint32_t offset, uint64_t
     return i;
 }
 
+// If all active DPUs within a block are supposed to receive the same
+// data (e.g., because we are doing a broadcast from a single buffer),
+// we can avoid reading the buffer eight times per bank and also vastly
+// simplify the transpose operation.
+static uint32_t
+write_to_rank_broadcast(uint32_t nb_cis, uint8_t* ptr_dest, uint32_t offset, uint64_t* source_ptr, size_t size_transfer, uint32_t i) {
+    if (nb_cis != 8) return i; // TODO: currently support only nb_cis == 8
+
+    const __m512i mask = _mm512_setr_epi64(
+            0 * 0x0101010101010101, 1 * 0x0101010101010101, 2 * 0x0101010101010101,
+            3 * 0x0101010101010101, 4 * 0x0101010101010101, 5 * 0x0101010101010101,
+            6 * 0x0101010101010101, 7 * 0x0101010101010101);
+
+    for (; i < size_transfer / sizeof(uint64_t); ++i) {
+        const __m512i value = _mm512_set1_epi64( (int64_t) *source_ptr++ );
+        const __m512i selected_bytes = _mm512_shuffle_epi8(value, mask);
+
+        const uint64_t* write_ptr = compute_mapped_mram_pointer(ptr_dest, i * sizeof(uint64_t) + offset);
+        _mm512_stream_si512((__m512i *)write_ptr, selected_bytes);
+    }
+
+    return i;
+}
+
+
 static void
 threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start, uint8_t dpu_id_stop)
 {
@@ -535,17 +560,19 @@ threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start
     FOREACH_DPU_MULTITHREAD(dpu_id, idx, dpu_id_start, dpu_id_stop)
     {
         uint32_t i;
-        uint8_t *ptr_dest = (uint8_t *)xeon_sp_priv->base_region_addr + BANK_START(dpu_id);
-        bool do_dpu_transfer = false;
+        uint8_t *ptr_dest = (uint8_t *) xeon_sp_priv->base_region_addr + BANK_START(dpu_id);
 
+        // search for a source pointer that is not-null
+        void *non_null_source_ptr = NULL;
         for (ci_id = 0; ci_id < nb_cis; ++ci_id) {
             if (xfer_matrix->ptr[idx + ci_id]) {
-                do_dpu_transfer = true;
+                non_null_source_ptr = xfer_matrix->ptr[idx + ci_id];
                 break;
             }
         }
 
-        if (!do_dpu_transfer)
+        // if non can be found, no transfer is necessary for this bank
+        if (!non_null_source_ptr)
             continue;
 
         if (xfer_matrix->type == DPU_SG_XFER_MATRIX) {
@@ -575,6 +602,23 @@ threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start
             // we employ different strategies to transfer data (e.g., block transfer of whole cache lines);
             // each method may advance the read index `i` as far as possible; the last step will take care of the rest.
             i = 0;
+
+            // in case all non-empty source are identical, we can fetch a single source and avoid the costly
+            // matrix transpose all together
+            {
+                bool do_broadcast = true;
+                for (ci_id = 0; ci_id < nb_cis; ++ci_id) {
+                    void *ptr = xfer_matrix_slice[ci_id];
+                    do_broadcast &= !ptr || (ptr == non_null_source_ptr);
+                }
+
+                // quite surprisingly, it is NOT faster to split the input into p disjoint ranges and parallelize over
+                // them, despite reducing the read volume by a factor of 8. so let's keep on parallelizing over DPU banks
+                // (which also reduces code overheads)
+                if (do_broadcast) {
+                    i = write_to_rank_broadcast(nb_cis, ptr_dest, offset, non_null_source_ptr, size_transfer, i);
+                }
+            }
 
             i = write_512b_to_bank(nb_cis, ptr_dest, offset, xfer_matrix_slice, size_transfer, i);
             i = write_64b_to_bank(nb_cis, ptr_dest, offset, xfer_matrix_slice, size_transfer, i);
