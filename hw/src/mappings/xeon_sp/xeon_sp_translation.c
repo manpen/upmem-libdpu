@@ -634,6 +634,30 @@ threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start
     }
 }
 
+static uint32_t
+read_from_rank_64b_block(uint32_t nb_cis, uint8_t *src_ptr, uint32_t offset, uint64_t** xfer_matrix_slice, size_t size_transfer, uint32_t i) {
+    if (nb_cis != 8) return i; // TODO: currently support only nb_cis == 8
+
+    __m512i matrix[8];
+
+    for (; (i + 8) < size_transfer / sizeof(uint64_t); i += 8) {
+        for (uint32_t j = 0; j < 8; j++) {
+            uint64_t *bank_ptr = compute_mapped_mram_pointer(src_ptr, (i + j) * sizeof(uint64_t) + offset);
+            matrix[j] = _mm512_stream_load_si512(bank_ptr);
+        }
+
+        deinterleave_and_transpose_64words_avx512(matrix);
+
+        for (size_t j = 0; j < 8; j++) {
+            if (xfer_matrix_slice[j])
+                _mm512_storeu_si512(xfer_matrix_slice[j] + i, matrix[j]);
+        }
+    }
+
+    return i;
+}
+
+
 static void
 threads_read_from_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start, uint8_t dpu_id_stop)
 {
@@ -647,6 +671,8 @@ threads_read_from_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_star
 
     if (!size_transfer)
         return;
+
+    __builtin_ia32_mfence();
 
     /* Works only for transfers of same size and same offset on the
      * same line
@@ -668,18 +694,18 @@ threads_read_from_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_star
             continue;
         __builtin_ia32_mfence();
 
-        for (i = 0; i < size_transfer / sizeof(uint64_t); ++i) {
-            uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
-            uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
-            uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
-
-            /* Invalidates possible prefetched cache line or old cache line */
-            __builtin_ia32_clflushopt((uint8_t *)ptr_dest + offset);
-        }
-
-        __builtin_ia32_mfence();
-
         if (xfer_matrix->type == DPU_SG_XFER_MATRIX) {
+            for (i = 0; i < size_transfer / sizeof(uint64_t); ++i) {
+                uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
+                uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
+                uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
+
+                /* Invalidates possible prefetched cache line or old cache line */
+                __builtin_ia32_clflushopt((uint8_t *)ptr_dest + offset);
+            }
+
+            __builtin_ia32_mfence();
+
             struct sg_xfer_buffer_iterator sg_it[nb_cis];
 
             /* Initialize sg buffer iterators */
@@ -710,42 +736,41 @@ threads_read_from_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_star
                         write_next_eight_bytes(&sg_it[ci_id], &cache_line_interleave[ci_id]);
                 }
             }
-        } else {
+
+            __builtin_ia32_mfence();
+
             for (i = 0; i < size_transfer / sizeof(uint64_t); ++i) {
                 uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
                 uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
                 uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
 
-                cache_line[0] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 0 * sizeof(uint64_t)));
-                cache_line[1] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 1 * sizeof(uint64_t)));
-                cache_line[2] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 2 * sizeof(uint64_t)));
-                cache_line[3] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 3 * sizeof(uint64_t)));
-                cache_line[4] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 4 * sizeof(uint64_t)));
-                cache_line[5] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 5 * sizeof(uint64_t)));
-                cache_line[6] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 6 * sizeof(uint64_t)));
-                cache_line[7] = *((volatile uint64_t *)((uint8_t *)ptr_dest + offset + 7 * sizeof(uint64_t)));
+                __builtin_ia32_clflushopt((uint8_t *)ptr_dest + offset);
+            }
 
-                byte_interleave_avx2(cache_line, cache_line_interleave);
+            __builtin_ia32_mfence();
+        } else {
+            i = 0;
+
+            i= read_from_rank_64b_block(nb_cis, ptr_dest, offset, (uint64_t**) &xeon_sp_priv->xfer_matrix->ptr[idx], size_transfer, i);
+
+            for (; i < size_transfer / sizeof(uint64_t); ++i) {
+                uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
+                uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
+                uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
+
+                // TODO: The volatile reads and explicit cache invalidation seem unnecessary here, since stream_reads
+                // are uncachable wc. But I might have missed a reason
+                __m512i interleaved_from_dpus = _mm512_stream_load_si512(ptr_dest + offset);
+                __m512i unscrambled = byte_interleave_avx512_inner(interleaved_from_dpus);
+                _mm512_store_si512(cache_line, unscrambled);
 
                 for (ci_id = 0; ci_id < nb_cis; ++ci_id) {
                     if (xfer_matrix->ptr[idx + ci_id]) {
-                        *((uint64_t *)xfer_matrix->ptr[idx + ci_id] + i) = cache_line_interleave[ci_id];
+                        *((uint64_t *)xfer_matrix->ptr[idx + ci_id] + i) = cache_line[ci_id];
                     }
                 }
             }
         }
-
-        __builtin_ia32_mfence();
-
-        for (i = 0; i < size_transfer / sizeof(uint64_t); ++i) {
-            uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
-            uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
-            uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
-
-            __builtin_ia32_clflushopt((uint8_t *)ptr_dest + offset);
-        }
-
-        __builtin_ia32_mfence();
     }
 }
 
