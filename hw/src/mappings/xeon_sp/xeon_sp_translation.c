@@ -462,6 +462,58 @@ write_next_eight_bytes(struct sg_xfer_buffer_iterator *sg_it, uint64_t *in_buffe
     }
 }
 
+FORCED_INLINE static void* compute_mapped_mram_pointer(void* base_ptr, uint32_t offset) {
+    uint32_t mram_64_bit_word_offset =
+            apply_address_translation_on_mram_offset(offset) / 8;
+    uint64_t next_data =
+            BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
+    uint64_t byte_offset = (next_data % BANK_CHUNK_SIZE) +
+                           (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
+
+    return base_ptr + byte_offset;
+}
+
+static uint32_t
+write_64b_to_bank(uint32_t nb_cis, uint8_t *ptr_dest, uint32_t offset, uint64_t** xfer_matrix_slice, size_t size_transfer, uint32_t i) {
+    uint64_t __attribute__ ((aligned (64))) cache_lines[8][NB_REAL_CIS];
+
+    for (; i < size_transfer / sizeof(uint64_t); ++i) {
+        for (uint32_t ci_id = 0; ci_id < nb_cis; ++ci_id) {
+            if (xfer_matrix_slice[ci_id])
+                cache_lines[0][ci_id] = xfer_matrix_slice[ci_id][i];
+        }
+
+        const uint64_t* write_ptr = compute_mapped_mram_pointer(ptr_dest, i * sizeof(uint64_t) + offset);
+        byte_interleave_avx512( cache_lines[0], (uint64_t *)write_ptr, true);
+    }
+
+    return i;
+}
+
+
+static uint32_t
+write_512b_to_bank(uint32_t nb_cis, uint8_t *ptr_dest, uint32_t offset, uint64_t** xfer_matrix_slice, size_t size_transfer, uint32_t i) {
+    if (nb_cis != 8) return i; // TODO: currently support only nb_cis == 8
+
+    __m512i matrix[8];
+
+    for (; (i + 8) < size_transfer / sizeof(uint64_t); i += 8) {
+        for (uint32_t ci_id = 0; ci_id < 8; ++ci_id) {
+            if (!xfer_matrix_slice[ci_id]) continue;
+            matrix[ci_id] = _mm512_loadu_si512(xfer_matrix_slice[ci_id] + i);
+        }
+
+        transpose_and_interleave_64words_avx512(matrix);
+
+        for (uint32_t j = 0; j < 8; j++) {
+            const uint64_t *write_ptr = compute_mapped_mram_pointer(ptr_dest, (i + j) * sizeof(uint64_t) + offset);
+            _mm512_stream_si512((__m512i *) write_ptr, matrix[j]);
+        }
+    }
+
+    return i;
+}
+
 static void
 threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start, uint8_t dpu_id_stop)
 {
@@ -518,18 +570,14 @@ threads_write_to_rank(struct xeon_sp_private *xeon_sp_priv, uint8_t dpu_id_start
                 byte_interleave_avx512(cache_line, (uint64_t *)((uint8_t *)ptr_dest + offset), true);
             }
         } else {
-            for (i = 0; i < size_transfer / sizeof(uint64_t); ++i) {
-                uint32_t mram_64_bit_word_offset = apply_address_translation_on_mram_offset(i * 8 + offset) / 8;
-                uint64_t next_data = BANK_OFFSET_NEXT_DATA(mram_64_bit_word_offset * sizeof(uint64_t));
-                uint64_t offset = (next_data % BANK_CHUNK_SIZE) + (next_data / BANK_CHUNK_SIZE) * BANK_NEXT_CHUNK_OFFSET;
+            uint64_t **xfer_matrix_slice = (uint64_t **) &xfer_matrix->ptr[idx];
 
-                for (ci_id = 0; ci_id < nb_cis; ++ci_id) {
-                    if (xfer_matrix->ptr[idx + ci_id])
-                        cache_line[ci_id] = *((uint64_t *)xfer_matrix->ptr[idx + ci_id] + i);
-                }
+            // we employ different strategies to transfer data (e.g., block transfer of whole cache lines);
+            // each method may advance the read index `i` as far as possible; the last step will take care of the rest.
+            i = 0;
 
-                byte_interleave_avx512(cache_line, (uint64_t *)((uint8_t *)ptr_dest + offset), true);
-            }
+            i = write_512b_to_bank(nb_cis, ptr_dest, offset, xfer_matrix_slice, size_transfer, i);
+            i = write_64b_to_bank(nb_cis, ptr_dest, offset, xfer_matrix_slice, size_transfer, i);
         }
 
         __builtin_ia32_mfence();
