@@ -23,6 +23,8 @@
 #include <sys/sysinfo.h>
 #include "static_verbose.h"
 
+#include "avx512_transpose.h"
+
 static struct verbose_control *this_vc;
 static struct verbose_control *
 __vc()
@@ -147,71 +149,6 @@ byte_interleave_avx2(uint64_t *input, uint64_t *output)
     _mm256_storeu_si256((__m256i *)&dst1[0], final0);
     _mm256_storeu_si256((__m256i *)&dst1[32], final1);
 }
-
-void
-byte_interleave_avx512(uint64_t *input, uint64_t *output, bool use_stream)
-{
-    __m512i load = _mm512_loadu_epi32(input);
-
-    // LEVEL 0
-    __m512i vindex =
-            _mm512_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
-    __m512i gathered = _mm512_permutexvar_epi32(vindex, load);
-
-    // LEVEL 1
-    __m512i mask = _mm512_set_epi64(0x0f0b07030e0a0602ULL,
-                            0x0d0905010c080400ULL,
-
-                            0x0f0b07030e0a0602ULL,
-                            0x0d0905010c080400ULL,
-
-                            0x0f0b07030e0a0602ULL,
-                            0x0d0905010c080400ULL,
-
-                            0x0f0b07030e0a0602ULL,
-                            0x0d0905010c080400ULL);
-
-    __m512i transpose = _mm512_shuffle_epi8(gathered, mask);
-
-    // LEVEL 2
-    __m512i perm = _mm512_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15);
-    __m512i final = _mm512_permutexvar_epi32(perm, transpose);
-
-    if (use_stream) {
-        _mm512_stream_si512((void *)output, final);
-        return;
-    }
-
-    _mm512_storeu_si512((void *)output, final);
-}
-
-#ifdef __AVX512VBMI__
-void
-byte_interleave_avx512vbmi(uint64_t *src, uint64_t *dst, bool use_stream)
-{
-    const __m512i trans8x8shuf = _mm512_set_epi64(0x0f0b07030e0a0602ULL,
-        0x0d0905010c080400ULL,
-
-        0x0f0b07030e0a0602ULL,
-        0x0d0905010c080400ULL,
-
-        0x0f0b07030e0a0602ULL,
-        0x0d0905010c080400ULL,
-
-        0x0f0b07030e0a0602ULL,
-        0x0d0905010c080400ULL);
-
-    __m512i vsrc = _mm512_loadu_si512(src);
-    __m512i shuffled = _mm512_permutexvar_epi8(trans8x8shuf, vsrc);
-
-    if (use_stream) {
-        _mm512_stream_si512((void *)dst, shuffled);
-        return;
-    }
-
-    _mm512_storeu_si512(dst, shuffled);
-}
-#endif
 
 void
 write_block_sse4_1(uint8_t *ci_address, uint64_t *data)
