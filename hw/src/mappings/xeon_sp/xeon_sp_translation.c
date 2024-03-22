@@ -522,17 +522,53 @@ static uint32_t
 write_to_rank_broadcast(uint32_t nb_cis, uint8_t* ptr_dest, uint32_t offset, uint64_t* source_ptr, size_t size_transfer, uint32_t i) {
     if (nb_cis != 8) return i; // TODO: currently support only nb_cis == 8
 
+    // read 8 words
+    for (; i + 8 < size_transfer / sizeof(uint64_t); i += 8) {
+      const __m512i cacheline = _mm512_loadu_si512(source_ptr + i);
+
+      __m512i sources[4];
+      sources[0] = _mm512_shuffle_i32x4(cacheline, cacheline, 0b01010101 * 0);
+      sources[1] = _mm512_shuffle_i32x4(cacheline, cacheline, 0b01010101 * 1);
+      sources[2] = _mm512_shuffle_i32x4(cacheline, cacheline, 0b01010101 * 2);
+      sources[3] = _mm512_shuffle_i32x4(cacheline, cacheline, 0b01010101 * 3);
+
+      __m512i masks[2];
+      masks[0] =
+          _mm512_setr_epi64(0 * 0x0101010101010101, 1 * 0x0101010101010101,
+                            2 * 0x0101010101010101, 3 * 0x0101010101010101,
+                            4 * 0x0101010101010101, 5 * 0x0101010101010101,
+                            6 * 0x0101010101010101, 7 * 0x0101010101010101);
+
+      masks[1] =
+          _mm512_setr_epi64(8 * 0x0101010101010101, 9 * 0x0101010101010101,
+                            0xa * 0x0101010101010101, 0xb * 0x0101010101010101,
+                            0xc * 0x0101010101010101, 0xd * 0x0101010101010101,
+                            0xe * 0x0101010101010101, 0xf * 0x0101010101010101);
+
+      for (int j = 0; j < 8; ++j) {
+        const __m512i selected_bytes =
+            _mm512_shuffle_epi8(sources[j / 2], masks[j % 2]);
+
+        const uint64_t *write_ptr0 = compute_mapped_mram_pointer(
+            ptr_dest, (i + j) * sizeof(uint64_t) + offset);
+
+        _mm512_stream_si512((__m512i *)write_ptr0, selected_bytes);
+      }
+    }
+
+    // read 1 word
     const __m512i mask = _mm512_setr_epi64(
             0 * 0x0101010101010101, 1 * 0x0101010101010101, 2 * 0x0101010101010101,
             3 * 0x0101010101010101, 4 * 0x0101010101010101, 5 * 0x0101010101010101,
             6 * 0x0101010101010101, 7 * 0x0101010101010101);
 
     for (; i < size_transfer / sizeof(uint64_t); ++i) {
-        const __m512i value = _mm512_set1_epi64( (int64_t) *source_ptr++ );
-        const __m512i selected_bytes = _mm512_shuffle_epi8(value, mask);
+      const __m512i value = _mm512_set1_epi64((int64_t)source_ptr[i]);
+      const __m512i selected_bytes = _mm512_shuffle_epi8(value, mask);
 
-        const uint64_t* write_ptr = compute_mapped_mram_pointer(ptr_dest, i * sizeof(uint64_t) + offset);
-        _mm512_stream_si512((__m512i *)write_ptr, selected_bytes);
+      const uint64_t *write_ptr =
+          compute_mapped_mram_pointer(ptr_dest, i * sizeof(uint64_t) + offset);
+      _mm512_stream_si512((__m512i *)write_ptr, selected_bytes);
     }
 
     return i;
